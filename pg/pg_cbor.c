@@ -1,22 +1,23 @@
 
 #include "pg_cbor.h"
-#include "lib/stringinfo.h"
+#include "utils/builtins.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
 
-//typedef unsigned char uint8_t;
-
-
 PG_FUNCTION_INFO_V1(is_cbor);
+PG_FUNCTION_INFO_V1(cbor_to_string);
 
 Datum
 is_cbor(PG_FUNCTION_ARGS) {
-	bytea *ptr = PG_GETARG_BYTEA_P(0);
-	size_t bsize = VARSIZE(ptr) - VARHDRSZ;
+	bytea *ptr;
+	size_t bsize;
+	const uint8_t *data;
 
-	const uint8_t *data = (const uint8_t *)VARDATA(ptr);
+	ptr = PG_GETARG_BYTEA_P(0);
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
 
 	if (data_is_cbor(data, bsize)) {
 		PG_RETURN_BOOL(1);
@@ -25,26 +26,29 @@ is_cbor(PG_FUNCTION_ARGS) {
     PG_RETURN_BOOL(0);
 }
 
-PG_FUNCTION_INFO_V1(cbor_to_text);
-
 Datum
-cbor_to_text(PG_FUNCTION_ARGS) {
-	bytea *ptr = PG_GETARG_BYTEA_P(0);
-	size_t bsize = VARSIZE(ptr) - VARHDRSZ;
+cbor_to_string(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	size_t bsize;
+	const uint8_t *data;
+	StringInfo str;
 
-	StringInfo buf = makeStringInfo();
-
-
-
-	unsigned char *data = (unsigned char *)VARDATA(ptr);
-
-	if (bsize > 3 && data[0] == 0xd9 && data[1] == 0xd9 && data[2] == 0xf7) {
-		PG_RETURN_BOOL(1);
+	if (PG_ARGISNULL(0)) {
+		PG_RETURN_NULL();
 	}
 
-    PG_RETURN_BOOL(0);
-}
+	ptr = PG_GETARG_BYTEA_P(0);
+	bsize = VARSIZE(ptr) - VARHDRSZ;
 
+	data = (const uint8_t *)VARDATA(ptr);
+	if (data_is_cbor(data, bsize)) {
+		str = makeStringInfo();
+		CborToString(str, data, bsize);
+		PG_RETURN_TEXT_P(cstring_to_text_with_len(str->data, str->len));
+	} else {
+		PG_RETURN_NULL();
+	}
+}
 
 /*
 
