@@ -1,6 +1,8 @@
 
 #include "pg_cbor.h"
 #include "utils/builtins.h"
+#include "utils/array.h"
+#include "catalog/pg_type.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -8,12 +10,18 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(is_cbor);
 PG_FUNCTION_INFO_V1(cbor_to_string);
+PG_FUNCTION_INFO_V1(cbor_extract_path);
+PG_FUNCTION_INFO_V1(cbor_extract_path_text);
 
 Datum
 is_cbor(PG_FUNCTION_ARGS) {
 	bytea *ptr;
 	size_t bsize;
 	const uint8_t *data;
+
+	if (PG_ARGISNULL(0)) {
+	    PG_RETURN_BOOL(0);
+	}
 
 	ptr = PG_GETARG_BYTEA_P(0);
 	bsize = VARSIZE(ptr) - VARHDRSZ;
@@ -31,7 +39,9 @@ cbor_to_string(PG_FUNCTION_ARGS) {
 	bytea *ptr;
 	size_t bsize;
 	const uint8_t *data;
-	StringInfo str;
+	StringInfoData str;
+	struct CborWriter writer;
+	text *ret;
 
 	if (PG_ARGISNULL(0)) {
 		PG_RETURN_NULL();
@@ -39,16 +49,199 @@ cbor_to_string(PG_FUNCTION_ARGS) {
 
 	ptr = PG_GETARG_BYTEA_P(0);
 	bsize = VARSIZE(ptr) - VARHDRSZ;
-
 	data = (const uint8_t *)VARDATA(ptr);
 	if (data_is_cbor(data, bsize)) {
-		str = makeStringInfo();
-		CborToString(str, data, bsize);
-		PG_RETURN_TEXT_P(cstring_to_text_with_len(str->data, str->len));
+		initStringInfo(&str);
+		writer.plain = (CborWriterPlain)appendBinaryStringInfo;
+		writer.format = (CborWriterFormat)appendStringInfo;
+		writer.ctx = &str;
+
+		CborToString(&writer, data, bsize);
+		ret = cstring_to_text_with_len(str.data, str.len);
+		pfree(str.data);
+		PG_RETURN_TEXT_P(ret);
 	} else {
 		PG_RETURN_NULL();
 	}
 }
+
+struct PgCborIteratorPathData {
+	Datum *path;
+	int npath;
+};
+
+static CborData PgCborIteratorPathIter(struct PgCborIteratorPathData *data) {
+	if (data->npath > 0) {
+		CborData ret;
+		ret.size = VARSIZE(*data->path) - VARHDRSZ;
+		ret.ptr = (const uint8_t *)VARDATA(*data->path);
+
+		-- data->npath;
+		++ data->path;
+		return ret;
+	} else {
+		CborData ret;
+		ret.size = 0;
+		ret.ptr = NULL;
+		return ret;
+	}
+}
+
+static bool PgCborIteratorPath(CborIteratorContext *ctx, Datum *path, int npath) {
+	struct PgCborIteratorPathData data;
+	data.path = path;
+	data.npath = npath;
+
+	return CborIteratorPath(ctx, (CborIteratorPathCallback)&PgCborIteratorPathIter, &data);
+}
+
+Datum
+cbor_extract_path(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	ArrayType *path;
+	size_t bsize;
+	const uint8_t *data;
+
+	Datum *pathtext;
+	bool *pathnulls;
+	int	npath;
+
+	CborIteratorContext iter;
+	const uint8_t *begin;
+	const uint8_t *end;
+
+	int bc;
+	bytea *result;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+		PG_RETURN_NULL();
+	}
+
+	ptr = PG_GETARG_BYTEA_P(0);
+	path = PG_GETARG_ARRAYTYPE_P(1);
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
+
+	if (array_contains_nulls(path)) {
+		elog(ERROR, "Invalid path data");
+		PG_RETURN_NULL();
+	}
+
+	if (!data_is_cbor(data, bsize)) {
+		PG_RETURN_NULL();
+	}
+
+	deconstruct_array(path, TEXTOID, -1, false, 'i', &pathtext, &pathnulls, &npath);
+
+	if (npath <= 0) {
+		PG_RETURN_BYTEA_P(ptr);
+	}
+
+	if (CborIteratorInit(&iter, data, bsize)) {
+		if (PgCborIteratorPath(&iter, pathtext, npath)) {
+			begin = CborIteratorGetCurrentValuePtr(&iter);
+			end = CborIteratorReadCurrentValue(&iter);
+
+			bc = (end - begin) + VARHDRSZ + CborHeaderSize;
+			result = palloc(bc);
+
+			memcpy(VARDATA(result), CborHeaderData, CborHeaderSize);
+			memcpy(VARDATA(result) + CborHeaderSize, begin, end - begin);
+			SET_VARSIZE(result, bc + VARHDRSZ);
+
+			CborIteratorFinalize(&iter);
+			PG_RETURN_BYTEA_P(result);
+		}
+	}
+	PG_RETURN_NULL();
+}
+
+Datum
+cbor_extract_path_text(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	ArrayType *path;
+
+	size_t bsize;
+	const uint8_t *data;
+
+	Datum *pathtext;
+	bool *pathnulls;
+	int	npath;
+
+	struct CborWriter writer;
+	StringInfoData str;
+	CborIteratorContext iter;
+	text *ret = NULL;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+		PG_RETURN_NULL();
+	}
+
+	ptr = PG_GETARG_BYTEA_P(0);
+	path = PG_GETARG_ARRAYTYPE_P(1);
+
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
+
+	if (array_contains_nulls(path)) {
+		elog(ERROR, "Invalid path data");
+		PG_RETURN_NULL();
+	}
+
+	if (!data_is_cbor(data, bsize)) {
+		PG_RETURN_NULL();
+	}
+
+	deconstruct_array(path, TEXTOID, -1, false, 'i', &pathtext, &pathnulls, &npath);
+
+	if (npath <= 0) {
+		initStringInfo(&str);
+		writer.plain = (CborWriterPlain)appendBinaryStringInfo;
+		writer.format = (CborWriterFormat)appendStringInfo;
+		writer.ctx = &str;
+
+		CborToString(&writer, data, bsize);
+
+		ret = cstring_to_text_with_len(str.data, str.len);
+		pfree(str.data);
+		PG_RETURN_TEXT_P(ret);
+	}
+
+	if (CborIteratorInit(&iter, data, bsize)) {
+		if (PgCborIteratorPath(&iter, pathtext, npath)) {
+			if (CborIteratorGetType(&iter) == CborTypeCharString) {
+				if (iter.token == CborIteratorTokenBeginCharStrings) {
+					StringInfoData str;
+					initStringInfo(&str);
+					while (CborIteratorNext(&iter) != CborIteratorTokenEndCharStrings) {
+						if (iter.token == CborIteratorTokenValue) {
+							appendBinaryStringInfo(&str, CborIteratorGetCharPtr(&iter), CborIteratorGetObjectSize(&iter));
+						}
+					}
+					ret = cstring_to_text_with_len(str.data, str.len);
+					pfree(str.data);
+				} else {
+					ret = cstring_to_text_with_len(CborIteratorGetCharPtr(&iter), CborIteratorGetObjectSize(&iter));
+				}
+			} else {
+				initStringInfo(&str);
+				writer.plain = (CborWriterPlain)appendBinaryStringInfo;
+				writer.format = (CborWriterFormat)appendStringInfo;
+				writer.ctx = &str;
+				CborIteratorValueToString(&writer, &iter);
+				ret = cstring_to_text_with_len(str.data, str.len);
+				pfree(str.data);
+			}
+
+			CborIteratorFinalize(&iter);
+			if (ret) {
+				PG_RETURN_TEXT_P(ret);
+			}
+		}
+	}
+	PG_RETURN_NULL();
+}
+
 
 /*
 

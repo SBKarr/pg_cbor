@@ -1,6 +1,6 @@
 MODULE_big = pg_cbor
 EXTENSION = pg_cbor
-DATA = pg_cbor--0.1.sql
+DATA = pg_cbor--0.2.sql
 
 GLOBAL_ROOT := ..
 
@@ -33,6 +33,6 @@ OBJS := $(patsubst %.c,%.o,$(LIB_SRCS))
 
 PG_CPPFLAGS = $(addprefix -I,$(LIB_INCLUDES)) -DPOSTGRES
 
-PG_CONFIG = pg_config
+PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

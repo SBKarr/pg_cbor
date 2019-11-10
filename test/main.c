@@ -6,8 +6,9 @@
 #include <string.h>
 #include <ftw.h>
 #include <dirent.h>
+#include <stdarg.h>
 
-#include "cbor_iter.h"
+#include "cbor.h"
 
 static void print_hex(const uint8_t *s, size_t size) {
 	while (size > 0) {
@@ -31,7 +32,7 @@ static void process_cbor_value(const CborIteratorContext *iter, const char *toke
 	case CborTypeTag: printf("%s Tag(%lu)\n", token, CborIteratorGetUnsigned(iter)); break;
 	case CborTypeSimple: printf("%s Simple(%lu)\n", token, CborIteratorGetUnsigned(iter)); break;
 	case CborTypeFloat: printf("%s Float(%.10e)\n", token, CborIteratorGetFloat(iter)); break;
-	case CborTypeFalse: printf("%s False)\n", token); break;
+	case CborTypeFalse: printf("%s False\n", token); break;
 	case CborTypeTrue: printf("%s True\n", token); break;
 	case CborTypeNull: printf("%s Null\n", token); break;
 	case CborTypeUndefined: printf("%s Undefined\n", token); break;
@@ -45,10 +46,57 @@ static void do_indent(uint32_t l) {
 	}
 }
 
+static void printString(void *ptr, const char *str, int size) {
+	printf("%.*s", size, str);
+}
+
+static void printFormat(void *ptr, const char *format, ...) {
+	va_list argv;
+	va_start (argv, format);
+	vprintf(format, argv);
+	va_end(argv);
+}
+
 void process_file_data(const char *filename, const uint8_t *data, size_t size) {
 	uint32_t level = 1;
+
+	struct CborWriter writer = {
+		(CborWriterPlain)printString,
+		(CborWriterFormat)printFormat,
+		NULL
+	};
+
 	CborIteratorContext iter;
 	printf("File: %s\n", filename);
+	CborToString(&writer, data, size);
+	printf("\n");
+
+	if (CborIteratorInit(&iter, data, size)) {
+		const char *path[] = {
+			"result",
+			"0",
+			"data",
+			NULL
+		};
+
+		if (CborIteratorPathStrings(&iter, path, INT_MAX)) {
+			const uint8_t *begin = CborIteratorGetCurrentValuePtr(&iter);
+			const uint8_t *end = CborIteratorReadCurrentValue(&iter);
+
+			uint32_t bc = (end - begin) + CborHeaderSize;
+			uint8_t *result = malloc(bc);
+
+			memcpy(result, CborHeaderData, CborHeaderSize);
+			memcpy(result + CborHeaderSize, begin, end - begin);
+
+			CborToString(&writer, result, bc);
+
+			free(result);
+		}
+		printf("\n");
+	}
+
+	/*CborIteratorReset(&iter);
 	if (CborIteratorInit(&iter, data, size)) {
 		CborIteratorToken token = CborIteratorNext(&iter);
 		while (token != CborIteratorTokenDone) {
@@ -110,7 +158,7 @@ void process_file_data(const char *filename, const uint8_t *data, size_t size) {
 		}
 
 		CborIteratorFinalize(&iter);
-	}
+	}*/
 }
 
 void read_file(const char *dirname, const char *filename) {
@@ -162,15 +210,18 @@ int main(int argc, char* argv[]) {
 		cwd = realpath(argv[1], buf);
 	}
 
-	char nameBuf[PATH_MAX + 1] = { 0 };
-	for (uint32_t i = 1; i < 79; ++ i) {
-		sprintf(nameBuf, "%u.json", i);
-		print_file(cwd, nameBuf);
-		sprintf(nameBuf, "%u.diag", i);
-		print_file(cwd, nameBuf);
+	/*char nameBuf[PATH_MAX + 1] = { 0 };
+	for (uint32_t i = 75; i < 79; ++ i) {
+		//sprintf(nameBuf, "%u.json", i);
+		//print_file(cwd, nameBuf);
+		//sprintf(nameBuf, "%u.diag", i);
+		//print_file(cwd, nameBuf);
 		sprintf(nameBuf, "%u.cbor", i);
 		read_file(cwd, nameBuf);
-	}
+	}*/
+
+
+	read_file(cwd, "apps.cbor");
 
 	/*
 

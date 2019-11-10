@@ -7,9 +7,12 @@
 #include <stdbool.h>
 
 typedef struct CborData {
-	const uint8_t * ptr;
 	uint32_t size;
+	const uint8_t * ptr;
 } CborData;
+
+extern uint32_t CborHeaderSize;
+extern const uint8_t CborHeaderData[];
 
 bool data_is_cbor(const uint8_t *, uint32_t);
 

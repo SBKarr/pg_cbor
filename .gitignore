@@ -1,5 +1,7 @@
 **.o
 **.d
 **.so
+**.bc
 
 build
+.settings

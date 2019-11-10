@@ -3,7 +3,12 @@
 #include "cbor_iter.h"
 #include "cbor_typeinfo.h"
 
+#include "postgres.h"
+#include "fmgr.h"
+#include "utils/builtins.h"
+
 #include <string.h>
+#include <limits.h>
 
 static inline uint32_t get_cbor_integer_length(uint8_t info) {
 	switch (info) {
@@ -50,7 +55,7 @@ void CborIteratorReset(CborIteratorContext *ctx) {
 	memset(ctx, 0, sizeof(CborIteratorContext));
 }
 
-static CborIteratorToken CborIteratorPushStack(CborIteratorContext *ctx, CborStackType type, uint32_t count) {
+static CborIteratorToken CborIteratorPushStack(CborIteratorContext *ctx, CborStackType type, uint32_t count, const uint8_t *ptr) {
 	struct CborIteratorStackValue * newStackValue;
 
 	if (ctx->stackCapacity == ctx->stackSize) {
@@ -68,6 +73,7 @@ static CborIteratorToken CborIteratorPushStack(CborIteratorContext *ctx, CborSta
 	newStackValue = &ctx->currentStack[ctx->stackSize];
 	newStackValue->type = type;
 	newStackValue->position = 0;
+	newStackValue->ptr = ptr;
 	if (type == CborStackTypeObject && count != UINT32_MAX) {
 		newStackValue->count = count * 2;
 	} else {
@@ -86,9 +92,11 @@ static CborIteratorToken CborIteratorPushStack(CborIteratorContext *ctx, CborSta
 		return CborIteratorTokenBeginObject;
 		break;
 	case CborStackTypeByteString:
+		ctx->isStreaming = true;
 		return CborIteratorTokenBeginByteStrings;
 		break;
 	case CborStackTypeCharString:
+		ctx->isStreaming = true;
 		return CborIteratorTokenBeginCharStrings;
 		break;
 	default: break;
@@ -121,9 +129,11 @@ static CborIteratorToken CborIteratorPopStack(CborIteratorContext *ctx) {
 		return CborIteratorTokenEndObject;
 		break;
 	case CborStackTypeByteString:
+		ctx->isStreaming = false;
 		return CborIteratorTokenEndByteStrings;
 		break;
 	case CborStackTypeCharString:
+		ctx->isStreaming = false;
 		return CborIteratorTokenEndCharStrings;
 		break;
 	default: break;
@@ -135,28 +145,36 @@ CborIteratorToken CborIteratorNext(CborIteratorContext *ctx) {
 	struct CborIteratorStackValue *head;
 	CborStackType nextStackType;
 	uint8_t type;
+	const uint8_t *ptr;
 
 	if (!CborDataOffset(&ctx->current, ctx->objectSize)) {
 		if (ctx->stackHead) {
-			return CborIteratorPopStack(ctx);
+			ctx->token = CborIteratorPopStack(ctx);
+		} else {
+			ctx->token = CborIteratorTokenDone;
 		}
-		return CborIteratorTokenDone;
+		ctx->value = ctx->current.ptr;
+		return ctx->token;
 	}
 
 	head = ctx->stackHead;
 
 	// pop stack value if all objects was parsed
 	if (head && head->position >= head->count) {
-		return CborIteratorPopStack(ctx);
+		ctx->token = CborIteratorPopStack(ctx);
+		ctx->value = ctx->current.ptr;
+		return ctx->token;
 	}
 
 	// read flag value
+	ptr = ctx->current.ptr;
 	type = CborDataGetUnsigned(&ctx->current);
 	CborDataOffset(&ctx->current, 1);
 
 	// pop stack value for undefined length container
 	if (head && head->count == UINT32_MAX && type == (CborFlagsUndefinedLength | CborMajorTypeEncodedSimple)) {
-		return CborIteratorPopStack(ctx);
+		ctx->token = CborIteratorPopStack(ctx);
+		return ctx->token;
 	}
 
 	ctx->type = (type & CborFlagsMajorTypeMaskEncoded) >> CborFlagsMajorTypeShift;
@@ -207,17 +225,20 @@ CborIteratorToken CborIteratorNext(CborIteratorContext *ctx) {
 	default: break;
 	}
 
+	ctx->value = ptr;
 	if (nextStackType != CborStackTypeNone) {
 		if (ctx->info == CborFlagsUndefinedLength) {
-			return CborIteratorPushStack(ctx, nextStackType, UINT32_MAX);
+			ctx->token = CborIteratorPushStack(ctx, nextStackType, UINT32_MAX, ptr);
 		} else {
-			return CborIteratorPushStack(ctx, nextStackType, CborDataReadUnsignedValue(&ctx->current, ctx->info));
+			ctx->token = CborIteratorPushStack(ctx, nextStackType, CborDataReadUnsignedValue(&ctx->current, ctx->info), ptr);
 		}
+		return ctx->token;
 	}
 
-	return (head && head->type == CborStackTypeObject)
+	ctx->token = (head && head->type == CborStackTypeObject)
 		? ( head->position % 2 == 1 ? CborIteratorTokenKey : CborIteratorTokenValue )
 		: CborIteratorTokenValue;
+	return ctx->token;
 }
 
 CborType CborIteratorGetType(const CborIteratorContext *ctx) {
@@ -275,6 +296,9 @@ uint32_t CborIteratorGetContainerSize(const CborIteratorContext *ctx) {
 	if (!ctx->stackHead) {
 		return 0;
 	} else {
+		if (ctx->stackHead->count == UINT32_MAX) {
+			return ctx->stackHead->count;
+		}
 		return (ctx->stackHead->type == CborStackTypeObject) ? ctx->stackHead->count / 2 : ctx->stackHead->count;
 	}
 }
@@ -283,7 +307,7 @@ uint32_t CborIteratorGetContainerPosition(const CborIteratorContext *ctx) {
 	if (!ctx->stackHead) {
 		return 0;
 	} else {
-		return (ctx->stackHead->type == CborStackTypeObject) ? ctx->stackHead->position / 2 : ctx->stackHead->position;
+		return (ctx->stackHead->type == CborStackTypeObject) ? (ctx->stackHead->position - 1) / 2 : (ctx->stackHead->position - 1);
 	}
 }
 
@@ -362,4 +386,232 @@ const uint8_t *CborIteratorGetBytePtr(const CborIteratorContext *ctx) {
 	default: break;
 	}
 	return ret;
+}
+
+const uint8_t *CborIteratorGetCurrentValuePtr(const CborIteratorContext *ctx) {
+	switch (ctx->token) {
+	case CborIteratorTokenKey:
+	case CborIteratorTokenValue:
+		return ctx->value;
+		break;
+	case CborIteratorTokenBeginArray:
+	case CborIteratorTokenBeginObject:
+	case CborIteratorTokenBeginByteStrings:
+	case CborIteratorTokenBeginCharStrings:
+		return ctx->stackHead->ptr;
+		break;
+	default: break;
+	}
+	return NULL;
+}
+
+const uint8_t *CborIteratorReadCurrentValue(CborIteratorContext *iter) {
+	switch (iter->token) {
+	case CborIteratorTokenValue:
+	case CborIteratorTokenKey:
+		CborIteratorNext(iter);
+		return iter->value;
+		break;
+	case CborIteratorTokenBeginArray: {
+		uint32_t stack = iter->stackSize;
+		while (CborIteratorNext(iter) != CborIteratorTokenEndArray && iter->stackSize > stack - 1) { }
+		CborIteratorNext(iter);
+		return iter->value;
+		break;
+	}
+	case CborIteratorTokenBeginObject: {
+		uint32_t stack = iter->stackSize;
+		while (CborIteratorNext(iter) != CborIteratorTokenEndObject && iter->stackSize > stack - 1) { }
+		CborIteratorNext(iter);
+		return iter->value;
+		break;
+	}
+	case CborIteratorTokenBeginByteStrings:
+		while (CborIteratorNext(iter) != CborIteratorTokenEndByteStrings) { }
+		CborIteratorNext(iter);
+		return iter->value;
+		break;
+	case CborIteratorTokenBeginCharStrings:
+		while (CborIteratorNext(iter) != CborIteratorTokenEndCharStrings) { }
+		CborIteratorNext(iter);
+		return iter->value;
+		break;
+	default:
+		return NULL;
+		break;
+	}
+	return NULL;
+}
+
+bool CborIteratorGetIth(CborIteratorContext *ctx, long int lindex) {
+	uint32_t stackSize;
+	struct CborIteratorStackValue *h;
+
+	if (!ctx->stackHead || ctx->stackHead->type != CborStackTypeArray || ctx->token != CborIteratorTokenBeginArray) {
+		return false;
+	}
+
+	if (lindex >= 0) {
+		if ((uint32_t)lindex >= ctx->stackHead->count) {
+			return false;
+		}
+	} else if (lindex < 0) {
+		if (ctx->stackHead->count != UINT32_MAX) {
+			if ((uint32_t)-lindex > ctx->stackHead->count) {
+				return false;
+			} else {
+				lindex = ctx->stackHead->count + lindex;
+			}
+		} else {
+			return false;
+		}
+	}
+
+	stackSize = ctx->stackSize;
+	h = ctx->stackHead;
+
+	while ((h->position != lindex || ctx->stackSize > stackSize) && ctx->token != CborIteratorTokenDone) {
+		CborIteratorNext(ctx);
+	}
+
+	if (ctx->stackSize < stackSize || ctx->token == CborIteratorTokenDone) {
+		return false;
+	} else {
+		CborIteratorNext(ctx);
+		return true;
+	}
+}
+
+bool CborIteratorGetKey(CborIteratorContext *ctx, const char *str, uint32_t size) {
+	uint32_t stackSize;
+	const char *tmpstr = str;
+	uint32_t tmpsize = size;
+
+	if (!ctx->stackHead || ctx->stackHead->type != CborStackTypeObject || ctx->token != CborIteratorTokenBeginObject) {
+		return false;
+	}
+
+	stackSize = ctx->stackSize;
+	while (ctx->token != CborIteratorTokenDone && ctx->stackSize >= stackSize) {
+		CborIteratorToken token = CborIteratorNext(ctx);
+		if (ctx->stackSize == stackSize) {
+			switch (token) {
+			case CborIteratorTokenKey:
+				if (ctx->isStreaming) {
+					if (tmpstr && ctx->objectSize <= size) {
+						if (memcmp(str, ctx->current.ptr, ctx->objectSize) == 0) {
+							tmpstr += ctx->objectSize;
+							size -= ctx->objectSize;
+						} else {
+							// invalid key
+							tmpstr = NULL;
+						}
+					} else {
+						tmpstr = NULL;
+					}
+				} else if (ctx->type == CborMajorTypeByteString || ctx->type == CborMajorTypeCharString) {
+					if (ctx->objectSize == size && memcmp(str, ctx->current.ptr, size) == 0) {
+						CborIteratorNext(ctx);
+						return true;
+					}
+				}
+				break;
+			case CborIteratorTokenValue:
+				if (tmpsize == 0) {
+					return true;
+				}
+				tmpstr = str;
+				tmpsize = size;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
+	if (ctx->stackSize < stackSize || ctx->token == CborIteratorTokenDone) {
+		return false;
+	} else {
+		return true;
+	}
+}
+
+bool CborIteratorPath(CborIteratorContext *ctx, CborIteratorPathCallback cb, void *ptr) {
+	struct CborData data = cb(ptr);
+
+	CborIteratorToken token = CborIteratorNext(ctx);
+	switch (token) {
+	case CborIteratorTokenBeginArray:
+	case CborIteratorTokenBeginObject:
+		if (data.ptr == NULL) {
+			return true;
+		}
+		// continue
+		break;
+	case CborIteratorTokenValue:
+	case CborIteratorTokenBeginByteStrings:
+	case CborIteratorTokenBeginCharStrings:
+		return data.ptr == NULL;
+		break;
+	default:
+		return false;
+		break;
+	}
+
+	while (data.ptr) {
+		switch (token) {
+		case CborIteratorTokenBeginArray: {
+			const char *indextext = (const char *)data.ptr;
+			char *endptr;
+			long int lindex = strtol(indextext, &endptr, 10);
+			if (endptr == indextext || *endptr != '\0' || lindex > INT_MAX || lindex < INT_MIN) {
+				return false;
+			}
+
+			if (!CborIteratorGetIth(ctx, lindex)) {
+				return false;
+			}
+			token = ctx->token;
+			break;
+		}
+		case CborIteratorTokenBeginObject:
+			if (!CborIteratorGetKey(ctx, (const char *)data.ptr, data.size)) {
+				return false;
+			}
+			token = ctx->token;
+			break;
+		default:
+			return false;
+			break;
+		}
+		data = cb(ptr);
+	}
+
+	return true;
+}
+
+struct CborIteratorPathStringsData {
+	const char **path;
+	int npath;
+};
+
+static CborData CborIteratorPathStringsIter(struct CborIteratorPathStringsData *data) {
+	if (data->npath > 0) {
+		CborData ret = {(*data->path) ? strlen(*data->path) : 0, (const uint8_t *)*data->path};
+		-- data->npath;
+		++ data->path;
+		return ret;
+	} else {
+		CborData ret = { 0, NULL };
+		return ret;
+	}
+}
+
+bool CborIteratorPathStrings(CborIteratorContext *ctx, const char **path, int npath) {
+	struct CborIteratorPathStringsData data = {
+		path,
+		npath
+	};
+
+	return CborIteratorPath(ctx, (CborIteratorPathCallback)&CborIteratorPathStringsIter, &data);
 }

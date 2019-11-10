@@ -3,6 +3,7 @@
 	<name>pg_cbor</name>
 	<comment></comment>
 	<projects>
+		<project>postgresql</project>
 	</projects>
 	<buildSpec>
 		<buildCommand>
