@@ -13,6 +13,12 @@ PG_FUNCTION_INFO_V1(cbor_to_string);
 PG_FUNCTION_INFO_V1(cbor_extract_path);
 PG_FUNCTION_INFO_V1(cbor_extract_path_text);
 
+PG_FUNCTION_INFO_V1(cbor_path_as_text);
+PG_FUNCTION_INFO_V1(cbor_path_as_bytes);
+PG_FUNCTION_INFO_V1(cbor_path_as_int);
+PG_FUNCTION_INFO_V1(cbor_path_as_float);
+PG_FUNCTION_INFO_V1(cbor_path_as_bool);
+
 Datum
 is_cbor(PG_FUNCTION_ARGS) {
 	bytea *ptr;
@@ -142,8 +148,8 @@ cbor_extract_path(PG_FUNCTION_ARGS) {
 			begin = CborIteratorGetCurrentValuePtr(&iter);
 			end = CborIteratorReadCurrentValue(&iter);
 
-			bc = (end - begin) + VARHDRSZ + CborHeaderSize;
-			result = palloc(bc);
+			bc = (end - begin) + CborHeaderSize;
+			result = palloc(bc + VARHDRSZ);
 
 			memcpy(VARDATA(result), CborHeaderData, CborHeaderSize);
 			memcpy(VARDATA(result) + CborHeaderSize, begin, end - begin);
@@ -154,6 +160,59 @@ cbor_extract_path(PG_FUNCTION_ARGS) {
 		}
 	}
 	PG_RETURN_NULL();
+}
+
+static text *
+pg_cbor_to_text(CborIteratorContext *iter) {
+	text *ret = NULL;
+	if (CborIteratorGetType(iter) == CborTypeCharString) {
+		if (iter->token == CborIteratorTokenBeginCharStrings) {
+			StringInfoData str;
+			initStringInfo(&str);
+			while (CborIteratorNext(iter) != CborIteratorTokenEndCharStrings) {
+				if (iter->token == CborIteratorTokenValue) {
+					appendBinaryStringInfo(&str, CborIteratorGetCharPtr(iter), CborIteratorGetObjectSize(iter));
+				}
+			}
+			ret = cstring_to_text_with_len(str.data, str.len);
+			pfree(str.data);
+		} else {
+			ret = cstring_to_text_with_len(CborIteratorGetCharPtr(iter), CborIteratorGetObjectSize(iter));
+		}
+	}
+	return ret;
+}
+
+static bytea *
+pg_cbor_to_bytes(CborIteratorContext *iter) {
+	bytea *result = NULL;
+	const uint8_t *ptr;
+	uint32_t len;
+	if (CborIteratorGetType(iter) == CborTypeByteString) {
+		if (iter->token == CborIteratorTokenBeginByteStrings) {
+			StringInfoData str;
+			initStringInfo(&str);
+			while (CborIteratorNext(iter) != CborIteratorTokenEndByteStrings) {
+				if (iter->token == CborIteratorTokenValue) {
+					appendBinaryStringInfo(&str, CborIteratorGetCharPtr(iter), CborIteratorGetObjectSize(iter));
+				}
+			}
+
+			result = palloc(str.len + VARHDRSZ);
+			memcpy(VARDATA(result), str.data, str.len);
+			SET_VARSIZE(result, str.len + VARHDRSZ);
+
+			pfree(str.data);
+		} else {
+			ptr = CborIteratorGetBytePtr(iter);
+			len = CborIteratorGetObjectSize(iter);
+
+			result = palloc(len + VARHDRSZ);
+			memcpy(VARDATA(result), ptr, len);
+			SET_VARSIZE(result, len + VARHDRSZ);
+		}
+	}
+	return result;
 }
 
 Datum
@@ -210,19 +269,7 @@ cbor_extract_path_text(PG_FUNCTION_ARGS) {
 	if (CborIteratorInit(&iter, data, bsize)) {
 		if (PgCborIteratorPath(&iter, pathtext, npath)) {
 			if (CborIteratorGetType(&iter) == CborTypeCharString) {
-				if (iter.token == CborIteratorTokenBeginCharStrings) {
-					StringInfoData str;
-					initStringInfo(&str);
-					while (CborIteratorNext(&iter) != CborIteratorTokenEndCharStrings) {
-						if (iter.token == CborIteratorTokenValue) {
-							appendBinaryStringInfo(&str, CborIteratorGetCharPtr(&iter), CborIteratorGetObjectSize(&iter));
-						}
-					}
-					ret = cstring_to_text_with_len(str.data, str.len);
-					pfree(str.data);
-				} else {
-					ret = cstring_to_text_with_len(CborIteratorGetCharPtr(&iter), CborIteratorGetObjectSize(&iter));
-				}
+				ret = pg_cbor_to_text(&iter);
 			} else {
 				initStringInfo(&str);
 				writer.plain = (CborWriterPlain)appendBinaryStringInfo;
@@ -242,6 +289,289 @@ cbor_extract_path_text(PG_FUNCTION_ARGS) {
 	PG_RETURN_NULL();
 }
 
+Datum
+cbor_path_as_text(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	ArrayType *path;
+
+	size_t bsize;
+	const uint8_t *data;
+
+	Datum *pathtext;
+	bool *pathnulls;
+	int	npath;
+
+	CborIteratorContext iter;
+	text *ret = NULL;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+		PG_RETURN_NULL();
+	}
+
+	ptr = PG_GETARG_BYTEA_P(0);
+	path = PG_GETARG_ARRAYTYPE_P(1);
+
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
+
+	if (array_contains_nulls(path)) {
+		elog(ERROR, "Invalid path data");
+		PG_RETURN_NULL();
+	}
+
+	if (!data_is_cbor(data, bsize)) {
+		PG_RETURN_NULL();
+	}
+
+	deconstruct_array(path, TEXTOID, -1, false, 'i', &pathtext, &pathnulls, &npath);
+
+	if (CborIteratorInit(&iter, data, bsize)) {
+		if (npath <= 0) {
+			CborIteratorNext(&iter);
+			ret = pg_cbor_to_text(&iter);
+			CborIteratorFinalize(&iter);
+			if (ret) {
+				PG_RETURN_TEXT_P(ret);
+			}
+		} else if (PgCborIteratorPath(&iter, pathtext, npath)) {
+			ret = pg_cbor_to_text(&iter);
+			CborIteratorFinalize(&iter);
+			if (ret) {
+				PG_RETURN_TEXT_P(ret);
+			}
+		}
+	}
+	PG_RETURN_NULL();
+}
+
+Datum
+cbor_path_as_bytes(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	ArrayType *path;
+
+	size_t bsize;
+	const uint8_t *data;
+
+	Datum *pathtext;
+	bool *pathnulls;
+	int	npath;
+
+	CborIteratorContext iter;
+	bytea *ret = NULL;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+		PG_RETURN_NULL();
+	}
+
+	ptr = PG_GETARG_BYTEA_P(0);
+	path = PG_GETARG_ARRAYTYPE_P(1);
+
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
+
+	if (array_contains_nulls(path)) {
+		elog(ERROR, "Invalid path data");
+		PG_RETURN_NULL();
+	}
+
+	if (!data_is_cbor(data, bsize)) {
+		PG_RETURN_NULL();
+	}
+
+	deconstruct_array(path, TEXTOID, -1, false, 'i', &pathtext, &pathnulls, &npath);
+
+	if (CborIteratorInit(&iter, data, bsize)) {
+		if (npath <= 0) {
+			CborIteratorNext(&iter);
+			ret = pg_cbor_to_bytes(&iter);
+			CborIteratorFinalize(&iter);
+			if (ret) {
+				PG_RETURN_BYTEA_P(ptr);
+			}
+		} else if (PgCborIteratorPath(&iter, pathtext, npath)) {
+			ret = pg_cbor_to_bytes(&iter);
+			CborIteratorFinalize(&iter);
+			if (ret) {
+				PG_RETURN_BYTEA_P(ptr);
+			}
+		}
+	}
+	PG_RETURN_NULL();
+}
+
+Datum
+cbor_path_as_int(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	ArrayType *path;
+
+	size_t bsize;
+	const uint8_t *data;
+
+	Datum *pathtext;
+	bool *pathnulls;
+	int	npath;
+
+	CborIteratorContext iter;
+	int64_t ret;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+		PG_RETURN_NULL();
+	}
+
+	ptr = PG_GETARG_BYTEA_P(0);
+	path = PG_GETARG_ARRAYTYPE_P(1);
+
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
+
+	if (array_contains_nulls(path)) {
+		elog(ERROR, "Invalid path data");
+		PG_RETURN_NULL();
+	}
+
+	if (!data_is_cbor(data, bsize)) {
+		PG_RETURN_NULL();
+	}
+
+	deconstruct_array(path, TEXTOID, -1, false, 'i', &pathtext, &pathnulls, &npath);
+
+	if (CborIteratorInit(&iter, data, bsize)) {
+		if (npath <= 0) {
+			CborIteratorNext(&iter);
+			if (CborIteratorGetType(&iter) == CborTypeUnsigned || CborIteratorGetType(&iter) == CborTypeNegative) {
+				ret = CborIteratorGetInteger(&iter);
+				CborIteratorFinalize(&iter);
+				PG_RETURN_INT64(ret);
+			}
+			CborIteratorFinalize(&iter);
+		} else if (PgCborIteratorPath(&iter, pathtext, npath)) {
+			if (CborIteratorGetType(&iter) == CborTypeUnsigned || CborIteratorGetType(&iter) == CborTypeNegative) {
+				ret = CborIteratorGetInteger(&iter);
+				CborIteratorFinalize(&iter);
+				PG_RETURN_INT64(ret);
+			}
+			CborIteratorFinalize(&iter);
+		}
+	}
+	PG_RETURN_NULL();
+}
+
+Datum
+cbor_path_as_float(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	ArrayType *path;
+
+	size_t bsize;
+	const uint8_t *data;
+
+	Datum *pathtext;
+	bool *pathnulls;
+	int	npath;
+
+	CborIteratorContext iter;
+	double ret;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+		PG_RETURN_NULL();
+	}
+
+	ptr = PG_GETARG_BYTEA_P(0);
+	path = PG_GETARG_ARRAYTYPE_P(1);
+
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
+
+	if (array_contains_nulls(path)) {
+		elog(ERROR, "Invalid path data");
+		PG_RETURN_NULL();
+	}
+
+	if (!data_is_cbor(data, bsize)) {
+		PG_RETURN_NULL();
+	}
+
+	deconstruct_array(path, TEXTOID, -1, false, 'i', &pathtext, &pathnulls, &npath);
+
+	if (CborIteratorInit(&iter, data, bsize)) {
+		if (npath <= 0) {
+			CborIteratorNext(&iter);
+			if (CborIteratorGetType(&iter) == CborTypeFloat) {
+				ret = CborIteratorGetFloat(&iter);
+				CborIteratorFinalize(&iter);
+				PG_RETURN_FLOAT8(ret);
+			}
+			CborIteratorFinalize(&iter);
+		} else if (PgCborIteratorPath(&iter, pathtext, npath)) {
+			if (CborIteratorGetType(&iter) == CborTypeFloat) {
+				ret = CborIteratorGetFloat(&iter);
+				CborIteratorFinalize(&iter);
+				PG_RETURN_FLOAT8(ret);
+			}
+			CborIteratorFinalize(&iter);
+		}
+	}
+	PG_RETURN_NULL();
+}
+
+Datum
+cbor_path_as_bool(PG_FUNCTION_ARGS) {
+	bytea *ptr;
+	ArrayType *path;
+
+	size_t bsize;
+	const uint8_t *data;
+
+	Datum *pathtext;
+	bool *pathnulls;
+	int	npath;
+
+	CborIteratorContext iter;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+		PG_RETURN_NULL();
+	}
+
+	ptr = PG_GETARG_BYTEA_P(0);
+	path = PG_GETARG_ARRAYTYPE_P(1);
+
+	bsize = VARSIZE(ptr) - VARHDRSZ;
+	data = (const uint8_t *)VARDATA(ptr);
+
+	if (array_contains_nulls(path)) {
+		elog(ERROR, "Invalid path data");
+		PG_RETURN_NULL();
+	}
+
+	if (!data_is_cbor(data, bsize)) {
+		PG_RETURN_NULL();
+	}
+
+	deconstruct_array(path, TEXTOID, -1, false, 'i', &pathtext, &pathnulls, &npath);
+
+	if (CborIteratorInit(&iter, data, bsize)) {
+		if (npath <= 0) {
+			CborIteratorNext(&iter);
+			if (CborIteratorGetType(&iter) == CborTypeTrue) {
+				CborIteratorFinalize(&iter);
+				PG_RETURN_BOOL(true);
+			} else if (CborIteratorGetType(&iter) == CborTypeFalse) {
+				CborIteratorFinalize(&iter);
+				PG_RETURN_BOOL(false);
+			}
+			CborIteratorFinalize(&iter);
+		} else if (PgCborIteratorPath(&iter, pathtext, npath)) {
+			if (CborIteratorGetType(&iter) == CborTypeTrue) {
+				CborIteratorFinalize(&iter);
+				PG_RETURN_BOOL(true);
+			} else if (CborIteratorGetType(&iter) == CborTypeFalse) {
+				CborIteratorFinalize(&iter);
+				PG_RETURN_BOOL(false);
+			}
+			CborIteratorFinalize(&iter);
+		}
+	}
+	PG_RETURN_NULL();
+}
 
 /*
 
